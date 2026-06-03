@@ -1,5 +1,4 @@
 flask>=3.0
 olefile>=0.47
 lxml>=5.0
-mtef_py>=0.1.0
 cloudinary>=1.36.0
