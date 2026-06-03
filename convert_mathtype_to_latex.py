@@ -11,6 +11,7 @@ import zipfile
 import re
 import shutil
 import tempfile
+import posixpath
 from io import BytesIO
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +19,61 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import olefile
 from mtef_py.ole_util.helper import Helper
 from mtef_py.mtef import MTEF
+
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+O_NS = "urn:schemas-microsoft-com:office:office"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def resolve_docx_relationship_target(target, base_dir="word"):
+    """Resolve a relationship target to the normalized path used inside a DOCX zip."""
+    if not target:
+        return ""
+    normalized = target.replace("\\", "/")
+    if normalized.startswith("/"):
+        normalized = normalized.lstrip("/")
+    elif not normalized.startswith("word/"):
+        normalized = posixpath.normpath(posixpath.join(base_dir, normalized))
+    else:
+        normalized = posixpath.normpath(normalized)
+    return normalized
+
+
+def candidate_docx_target_paths(target):
+    candidates = [target]
+    if target.startswith("embeddings/"):
+        candidates.append(f"word/{target}")
+    if "/embeddings/" in target:
+        candidates.append(f"word/embeddings/{posixpath.basename(target)}")
+    return list(dict.fromkeys(candidates))
+
+
+def make_latex_run(etree, source_run, latex):
+    rpr = source_run.find(f"{{{W_NS}}}rPr")
+    if rpr is None:
+        rpr = etree.Element(f"{{{W_NS}}}rPr")
+
+    # Remove w:vertAlign (subscript / superscript) so the LaTeX text
+    # is not shrunken or raised/lowered relative to the baseline.
+    vert_align = rpr.find(f"{{{W_NS}}}vertAlign")
+    if vert_align is not None:
+        rpr.remove(vert_align)
+
+    # Add or update w:color tag to make the formula green (008000)
+    color_tag = rpr.find(f"{{{W_NS}}}color")
+    if color_tag is None:
+        color_tag = etree.Element(f"{{{W_NS}}}color")
+        rpr.append(color_tag)
+    color_tag.set(f"{{{W_NS}}}val", "008000")
+
+    source_run.clear()
+    source_run.append(rpr)
+
+    t_elem = etree.Element(f"{{{W_NS}}}t")
+    t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    t_elem.text = f"${latex}$"
+    source_run.append(t_elem)
 
 
 def clean_latex_formula(latex):
@@ -63,32 +119,81 @@ def convert_ole_to_latex(ole_bin_data):
     try:
         with open(tmp, "wb") as f:
             f.write(ole_bin_data)
+        
+        # Check if it's a valid OLE file
+        if not olefile.isOleFile(tmp):
+            print(f"WARNING: Not a valid OLE file (size: {len(ole_bin_data)} bytes)")
+            return None
+            
         ole = olefile.OleFileIO(tmp)
-        if ole.exists("Equation Native"):
-            stream_data = ole.openstream("Equation Native").read()
-            hdr_reader = BytesIO(stream_data[:28])
-            cb_hdr = Helper.bytes2int(hdr_reader.read(2))
-            if cb_hdr is None or cb_hdr != 28:
-                ole.close()
-                return None
-            hdr_reader.seek(4 + 2, 1)
-            cb_size = Helper.bytes2int(hdr_reader.read(4))
-            eqn_body = stream_data[cb_hdr : cb_hdr + cb_size]
-            eqn = MTEF()
-            eqn.reader = BytesIO(eqn_body)
-            eqn.readRecord()
-            eqn.makeAST()
-            latex = eqn.Translate()
+        
+        # Check if "Equation Native" stream exists
+        if not ole.exists("Equation Native"):
+            print(f"WARNING: No 'Equation Native' stream found")
+            # Try to list available streams for debugging
+            try:
+                streams = ole.listdir()
+                print(f"  Available streams: {streams}")
+            except:
+                pass
             ole.close()
-            return latex if latex else None
+            return None
+            
+        stream_data = ole.openstream("Equation Native").read()
+        
+        # Validate header
+        if len(stream_data) < 28:
+            print(f"WARNING: Stream data too short ({len(stream_data)} bytes)")
+            ole.close()
+            return None
+            
+        hdr_reader = BytesIO(stream_data[:28])
+        cb_hdr = Helper.bytes2int(hdr_reader.read(2))
+        
+        if cb_hdr is None or cb_hdr != 28:
+            print(f"WARNING: Invalid header size (cb_hdr={cb_hdr}, expected 28)")
+            ole.close()
+            return None
+            
+        hdr_reader.seek(4 + 2, 1)
+        cb_size = Helper.bytes2int(hdr_reader.read(4))
+        
+        if cb_size is None or cb_size <= 0:
+            print(f"WARNING: Invalid equation body size (cb_size={cb_size})")
+            ole.close()
+            return None
+            
+        if cb_hdr + cb_size > len(stream_data):
+            print(f"WARNING: Equation body extends beyond stream data")
+            ole.close()
+            return None
+            
+        eqn_body = stream_data[cb_hdr : cb_hdr + cb_size]
+        eqn = MTEF()
+        eqn.reader = BytesIO(eqn_body)
+        eqn.readRecord()
+        eqn.makeAST()
+        latex = eqn.Translate()
         ole.close()
-    except Exception:
-        pass
+        
+        if not latex:
+            print(f"WARNING: Translation returned empty/None")
+            return None
+            
+        return latex.strip()
+        
+    except Exception as e:
+        # Log the error to help debugging
+        print(f"ERROR: Failed to convert OLE object: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        
     finally:
         try:
             os.remove(tmp)
         except:
             pass
+    
     return None
 
 
@@ -112,34 +217,51 @@ def process_docx(input_path, output_path):
             rid = rel.get("Id", "")
             target = rel.get("Target", "")
             rel_type = rel.get("Type", "")
-            if "oleObject" in rel_type.lower() or target.endswith(".bin"):
-                rid_to_target[rid] = target
+            target_path = resolve_docx_relationship_target(target)
+            if "oleobject" in rel_type.lower() or target.lower().endswith(".bin"):
+                rid_to_target[rid] = target_path
 
     print(f"Relationships: {len(rid_to_target)}")
 
     # Load OLE objects and convert
     ole_objects = {}
+    
+    # Method 1: Try numbered oleObject files (oleObject1.bin, oleObject2.bin, ...)
     for i in range(1, 1000):
         fname = f"word/embeddings/oleObject{i}.bin"
         if fname in file_list:
             with zipfile.ZipFile(input_path, "r") as zin:
                 ole_objects[fname] = zin.read(fname)
+    
+    # Method 2: Also try any .bin files in embeddings folder
+    for fname in file_list:
+        if fname.startswith("word/embeddings/") and fname.endswith(".bin"):
+            if fname not in ole_objects:  # Don't duplicate
+                with zipfile.ZipFile(input_path, "r") as zin:
+                    ole_objects[fname] = zin.read(fname)
+    
+    print(f"Found {len(ole_objects)} OLE objects")
 
     latex_map = {}
+    conversion_errors = 0
     for fname, ole_data in ole_objects.items():
         latex = convert_ole_to_latex(ole_data)
         if latex:
             latex_map[fname] = latex.strip()
+        else:
+            conversion_errors += 1
 
     print(f"Converted: {len(latex_map)}/{len(ole_objects)}")
+    if conversion_errors > 0:
+        print(f"WARNING: Failed to convert {conversion_errors} objects")
 
     # Build rId -> LaTeX
     rid_to_latex = {}
     for rid, target in rid_to_target.items():
-        full_path = "word/" + target if not target.startswith("word/") else target
-        full_path = full_path.replace("\\", "/")
-        if full_path in latex_map:
-            rid_to_latex[rid] = latex_map[full_path]
+        for candidate in candidate_docx_target_paths(target):
+            if candidate in latex_map:
+                rid_to_latex[rid] = latex_map[candidate]
+                break
 
     print(f"rId->LaTeX: {len(rid_to_latex)}")
 
@@ -151,36 +273,32 @@ def process_docx(input_path, output_path):
     doc_xml_bytes = doc_xml.encode("utf-8") if isinstance(doc_xml, str) else doc_xml
     doc_tree = etree.fromstring(doc_xml_bytes)
 
-    namespaces = {
-        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
-        "o": "urn:schemas-microsoft-com:office:office",
-        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    }
+    namespaces = {"w": W_NS, "o": O_NS, "r": R_NS}
 
-    objects = doc_tree.xpath("//w:object", namespaces=namespaces)
+    ole_xml_objects = doc_tree.xpath("//o:OLEObject", namespaces=namespaces)
+    fallback_latex = [latex_map[fname] for fname in ole_objects if fname in latex_map]
     replaced = 0
 
-    for obj in objects:
-        ole_objs = obj.xpath(".//o:OLEObject", namespaces=namespaces)
-        if not ole_objs:
-            continue
-        ole_obj = ole_objs[0]
+    for xml_index, ole_obj in enumerate(ole_xml_objects):
         rid = ole_obj.get(
-            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+            f"{{{R_NS}}}id"
         )
-        if not rid or rid not in rid_to_latex:
+        latex = rid_to_latex.get(rid)
+        if not latex:
+            # Some Word files contain MathType OLE objects but the relationship
+            # target cannot be mapped cleanly. In that case the XML order usually
+            # matches word/embeddings/oleObjectN.bin order, so use it as a fallback.
+            latex = fallback_latex[xml_index] if xml_index < len(fallback_latex) else None
+        if not latex:
             continue
 
-        latex = clean_latex_formula(rid_to_latex[rid])
+        latex = clean_latex_formula(latex)
 
         # Find enclosing w:r
         parent_r = None
-        parent = obj.getparent()
+        parent = ole_obj.getparent()
         while parent is not None:
-            if (
-                parent.tag
-                == "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}r"
-            ):
+            if parent.tag == f"{{{W_NS}}}r":
                 parent_r = parent
                 break
             parent = parent.getparent()
@@ -188,52 +306,7 @@ def process_docx(input_path, output_path):
         if parent_r is None:
             continue
 
-        # Extract or create w:rPr
-        rpr = parent_r.find(
-            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rPr"
-        )
-        if rpr is None:
-            rpr = etree.Element(
-                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rPr"
-            )
-
-        # Remove w:vertAlign (subscript / superscript) so the LaTeX text
-        # is not shrunken or raised/lowered relative to the baseline.
-        vert_align = rpr.find(
-            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}vertAlign"
-        )
-        if vert_align is not None:
-            rpr.remove(vert_align)
-
-        # Add or update w:color tag to make the formula green (008000)
-        color_tag = rpr.find(
-            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}color"
-        )
-        if color_tag is None:
-            color_tag = etree.Element(
-                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}color"
-            )
-            rpr.append(color_tag)
-        color_tag.set(
-            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val",
-            "008000",
-        )
-
-        # Clear the run
-        parent_r.clear()
-
-        # Restore w:rPr
-        parent_r.append(rpr)
-
-        # Create w:t tag with the LaTeX formula
-        t_elem = etree.Element(
-            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
-        )
-        t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-        t_elem.text = f"${latex}$"
-
-        # Append w:t to the w:r
-        parent_r.append(t_elem)
+        make_latex_run(etree, parent_r, latex)
         replaced += 1
 
     print(f"Replaced: {replaced}")
@@ -1004,6 +1077,91 @@ def format_all_text_times_new_roman_12(input_path, output_path):
         except:
             pass
         raise
+
+
+def extract_underlined_answer(docx_path):
+    """
+    Extract the correct answer from underlined text in Word document.
+    Looks for underlined single letters: A, B, C, D (MCQ) or a, b, c, d (MSQ)
+    
+    Returns:
+        dict: Maps question number to correct answer (e.g., {"1": "A", "2": "B,C"})
+    """
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    
+    with zipfile.ZipFile(docx_path, "r") as zin:
+        doc_xml = zin.read("word/document.xml")
+    
+    from lxml import etree
+    
+    doc_xml_bytes = doc_xml.encode("utf-8") if isinstance(doc_xml, str) else doc_xml
+    doc_tree = etree.fromstring(doc_xml_bytes)
+    
+    namespaces = {"w": W}
+    paragraphs = doc_tree.xpath("//w:p", namespaces=namespaces)
+    
+    answer_map = {}
+    current_question_num = None
+    
+    for p in paragraphs:
+        # Get full paragraph text to identify question numbers
+        texts = p.xpath(".//w:t", namespaces=namespaces)
+        full_text = "".join(t.text or "" for t in texts)
+        
+        # Check if this paragraph starts with "Câu <number>"
+        question_match = re.match(r"^\s*[Cc]âu\s+(\d+)", full_text)
+        if question_match:
+            current_question_num = question_match.group(1)
+        
+        # Find all runs (w:r) in this paragraph
+        runs = p.xpath(".//w:r", namespaces=namespaces)
+        
+        for run in runs:
+            # Check if this run has underline formatting
+            rpr = run.find(f"{{{W}}}rPr")
+            if rpr is None:
+                continue
+            
+            underline = rpr.find(f"{{{W}}}u")
+            if underline is None:
+                continue
+            
+            # This run is underlined - extract text
+            t_elems = run.xpath(".//w:t", namespaces=namespaces)
+            underlined_text = "".join(t.text or "" for t in t_elems).strip()
+            
+            if not underlined_text:
+                continue
+            
+            # Match single letter answers: A, B, C, D (uppercase) or a, b, c, d (lowercase)
+            # Allow for variations like "A.", "A)", or just "A"
+            # Pattern: letter followed by optional delimiter (. or )) or whitespace or end
+            answer_pattern = re.findall(r'\b([A-Da-d])(?=[\.\),\s]|$)', underlined_text)
+            
+            if answer_pattern and current_question_num:
+                # Normalize to uppercase
+                answers = [a.upper() for a in answer_pattern]
+                
+                # For MCQ: single answer (A, B, C, or D)
+                # For MSQ: multiple answers (a,b or a,c,d) - combine with comma
+                if current_question_num not in answer_map:
+                    answer_map[current_question_num] = []
+                
+                answer_map[current_question_num].extend(answers)
+    
+    # Deduplicate and join multiple answers with comma
+    result = {}
+    for qnum, answers in answer_map.items():
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_answers = []
+        for a in answers:
+            if a not in seen:
+                seen.add(a)
+                unique_answers.append(a)
+        result[qnum] = ','.join(unique_answers)
+    
+    return result
 
 
 # Import upload images function

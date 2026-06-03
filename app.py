@@ -17,6 +17,7 @@ from flask import (
     url_for,
     send_file,
 )
+from werkzeug.utils import secure_filename
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,7 +30,10 @@ from convert_mathtype_to_latex import (
 )
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24).hex()
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.environ.get("MAX_CONTENT_LENGTH", 25 * 1024 * 1024)
+)
 
 UPLOAD_FOLDER = tempfile.mkdtemp(prefix="mathtype_uploads_")
 OUTPUT_FOLDER = tempfile.mkdtemp(prefix="mathtype_outputs_")
@@ -108,6 +112,11 @@ def clean_temp():
                 pass
 
 
+@app.route("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "GET":
@@ -122,8 +131,14 @@ def index():
         flash("Chỉ chấp nhận file .docx.", "error")
         return render_template_string(HTML)
 
-    in_path = os.path.join(UPLOAD_FOLDER, f.filename)
-    out_name = f.filename.replace(".docx", "-latex.docx")
+    filename = secure_filename(f.filename)
+    if not filename:
+        flash("Tên file không hợp lệ.", "error")
+        return render_template_string(HTML)
+
+    in_path = os.path.join(UPLOAD_FOLDER, filename)
+    root, _ = os.path.splitext(filename)
+    out_name = f"{root}-latex.docx"
     out_path = os.path.join(OUTPUT_FOLDER, out_name)
     f.save(in_path)
 

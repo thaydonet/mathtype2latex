@@ -55,6 +55,9 @@ class MTEF:
         self.mProduct = self._read1()
         self.mVersion = self._read1()
         self.mVersionSub = self._read1()
+        if self.mMtefVer >= 5:
+            self.mApplication, _ = self.readNullTerminatedString()
+            self.mInline = self._read1() or 0
 
         while True:
             record = self._read1()
