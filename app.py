@@ -68,8 +68,8 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 18px 0; }
 </head>
 <body>
 <div class="card">
-  <h1>📐 MathType → LaTeX</h1>
-  <p class="sub">Upload file .docx, chuyển công thức MathType thành LaTeX</p>
+  <h1 style="color: red;">📐 MathType → LaTeX</h1>
+  <p style="color: blue;">Upload file .docx, chuyển công thức MathType thành LaTeX</p>
 
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
@@ -84,7 +84,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 18px 0; }
     <input type="file" name="file" accept=".docx" required>
 
     <label for="keyword">Xóa dòng chứa keyword (tùy chọn)</label>
-    <input type="text" name="keyword" placeholder="Ví dụ: Hướng dẫn">
+    <input type="text" name="keyword" placeholder="Ví dụ: FB, Tác giả,...">
 
     <div class="checkbox-group">
       <label><input type="checkbox" name="delete_mucdo"> Xóa [Mức độ 1], [Mức độ 2]...</label>
@@ -96,7 +96,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 18px 0; }
   </form>
 
   <hr>
-  <p style="font-size:13px; color:#888; text-align:center;">Chạy trên server, không cần Word hay MathType</p>
+  <p style="font-size:13px; color:#888; text-align:center;">Thầy Đồ - 2026 - Chạy trên server, không cần Word hay MathType</p>
 </div>
 </body>
 </html>
